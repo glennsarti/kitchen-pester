@@ -20,6 +20,16 @@ require 'pathname'
 require 'kitchen/verifier/base'
 require 'kitchen/verifier/pester_version'
 
+# Monkey Patches
+require 'kitchen/configurable'
+module Kitchen
+  module Configurable
+    def public_env_wrapped(code)
+      env_wrapped(code)
+    end
+  end
+end
+
 module Kitchen
 
   module Verifier
@@ -73,10 +83,6 @@ module Kitchen
       #
       # @return [String] a command string
       def install_command
-        return if local_suite_files.empty?
-        return if config[:use_local_pester_module]
-
-        really_wrap_shell_code(install_command_script)
       end
 
       # Generates a command string which will perform any data initialization
@@ -105,12 +111,15 @@ module Kitchen
       # @return [String] a command string
       def run_command
         return if local_suite_files.empty?
-        really_wrap_shell_code(run_command_script)
+        # This is harcoded and I don't like it!
+        "pwsh -NoProfile -NonInteractive -NoLogo -File /tmp/verifier/RunTests.ps1"
       end
 
       #private
       def run_command_script
         <<-CMD
+          $Installer = Join-Path -Path $PSScriptRoot -ChildPath 'PreInstall.ps1'
+          if (Test-Path -Path $Installer) { & $installer -ErrorAction 'Stop' }
           $TestPath = "#{config[:root_path]}";
           import-module Pester -force;
           $result = invoke-pester -path $testpath -passthru ;
@@ -125,8 +134,10 @@ module Kitchen
       end
 
       def use_local_powershell_modules(script)
+        # Hardcoded tmp dir. I don't like this.
         <<-EOH
-          set-executionpolicy unrestricted -force;
+          if ($null -eq $ENV:temp) { $ENV:temp = '/tmp' }
+          # set-executionpolicy unrestricted -force;  # set-executionpolicy is not valid on Non-Windows
           $global:ProgressPreference = 'SilentlyContinue'
           $env:psmodulepath += ";$(join-path (resolve-path $env:temp).path 'verifier/modules')";
           #{script}
@@ -135,14 +146,17 @@ module Kitchen
 
       def install_command_script
         <<-EOH
+          $ErrorActionPreference = 'Stop'
+          if ($null -eq $ENV:temp) { $ENV:temp = '/tmp' }
           function directory($path){
+            Write-Host "Verifying path $path"
             if (test-path $path) {(resolve-path $path).providerpath}
-            else {(resolve-path (mkdir $path)).providerpath}
+            else {(resolve-path (New-Item -Path $path -ItemType Directory)).providerpath}
           }
           $VerifierModulePath = directory $env:temp/verifier/modules
           $VerifierTestsPath = directory $env:temp/verifier/pester
 
-    $env:psmodulepath += ";$VerifierModulePath"
+          $env:psmodulepath += ";$VerifierModulePath"
           function test-module($module){
             (get-module $module -list) -ne $null
           }
@@ -283,6 +297,17 @@ module Kitchen
           debug("Copying #{src} to #{dest}")
           FileUtils.mkdir_p(File.dirname(dest))
           FileUtils.cp(src, dest, preserve: true)
+        end
+
+        # Create the test script
+        unless local_suite_files.empty?
+          dest = File.join(sandbox_path, 'RunTests.ps1')
+          File.open(dest, 'wb:UTF-8') { |file| file.write(Util.outdent!(use_local_powershell_modules(run_command_script))) }
+        end
+        # Create the install script
+        unless local_suite_files.empty? || config[:use_local_pester_module]
+          dest = File.join(sandbox_path, 'PreInstall.ps1')
+          File.open(dest, 'wb:UTF-8') { |file| file.write(Util.outdent!(use_local_powershell_modules(install_command_script))) }
         end
       end
 
